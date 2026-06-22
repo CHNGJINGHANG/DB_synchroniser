@@ -27,6 +27,22 @@ needs to and noticeably heat up the machine):
 - Click history is pruned to the visible window so the per-frame pulse
   computation stays bounded instead of growing over a long session.
 
+BUGS FIXED vs original:
+1. Race condition in join_room: get_or_create_room and the admin-set
+   were two separate lock acquisitions, so two simultaneous joins could
+   both see admin_id=None and both become admin. Now merged into one
+   locked section.
+2. user_name was read from the URL query string in /room, so a user
+   could display any name by editing the URL after joining. Now read
+   from the authoritative room.users dict instead.
+3. strokesPerMinute used an exponential density kernel (tau=2s).  This
+   measures average *density*, not rhythm: a perfectly metronomic 60 BPM
+   player and a randomly-clicking-but-averaging-60 player look identical,
+   and the display lags ~4-6s before settling.  Replaced with an
+   inter-click-interval (ICI) estimator that matches how a metronome
+   works: tempo = 60 / median_recent_interval.  Responds within 2 beats
+   and correctly rewards regularity.
+
 RUN:
     pip install flask
     python sync_clicker_trainer.py
@@ -80,18 +96,27 @@ _lock = Lock()
 
 
 def get_or_create_room(room_id: str) -> RoomState:
-    with _lock:
-        if room_id not in _rooms:
-            _rooms[room_id] = RoomState()
-        return _rooms[room_id]
+    # Must NOT acquire _lock here -- callers that need the room also need
+    # to hold the lock across multiple operations (e.g. join_room), and
+    # Python's threading.Lock is not re-entrant.
+    if room_id not in _rooms:
+        _rooms[room_id] = RoomState()
+    return _rooms[room_id]
 
 
 def join_room(room_id: str, name: str):
     """Registers a user in a room. The first person to join becomes admin.
-    Returns (user_id, is_admin)."""
-    room = get_or_create_room(room_id)
+    Returns (user_id, is_admin).
+
+    BUG FIX: previously get_or_create_room held its own lock and released
+    it before this function acquired _lock again.  That gap meant two
+    simultaneous join requests could both observe admin_id=None and both
+    become admin.  Now the whole operation -- room creation, admin
+    assignment, user insertion -- is one atomic locked section.
+    """
     user_id = str(uuid.uuid4())[:8]
     with _lock:
+        room = get_or_create_room(room_id)   # safe: we already hold _lock
         is_admin = room.admin_id is None
         if is_admin:
             room.admin_id = user_id
@@ -103,8 +128,8 @@ def join_room(room_id: str, name: str):
 def start_room(room_id: str, user_id: str) -> bool:
     """Only the room's admin can start the session. Returns True on success,
     False if the caller isn't the admin."""
-    room = get_or_create_room(room_id)
     with _lock:
+        room = get_or_create_room(room_id)
         if room.admin_id != user_id:
             return False
         room.started = True
@@ -115,8 +140,8 @@ def start_room(room_id: str, user_id: str) -> bool:
 def register_click(room_id: str, user_id: str) -> bool:
     """Returns False (and does nothing) if the session hasn't been started
     yet -- clicking is gated server-side, not just hidden in the UI."""
-    room = get_or_create_room(room_id)
     with _lock:
+        room = get_or_create_room(room_id)
         if not room.started:
             return False
         if user_id in room.users:
@@ -143,9 +168,9 @@ def _prune_clicks_locked(room: RoomState, now: float):
 @app.get("/api/state")
 def api_state():
     room_id = request.args.get("room", "")
-    room = get_or_create_room(room_id)
     now = time.time()
     with _lock:
+        room = get_or_create_room(room_id)
         _prune_clicks_locked(room, now)
         payload = {
             "serverNow": now,
@@ -247,7 +272,7 @@ JOIN_PAGE = """
             });
             const data = await res.json();
             if (!res.ok) { err.textContent = data.error || "Could not join."; return; }
-            const params = new URLSearchParams({room: data.room_id, user: data.user_id, name: data.name});
+            const params = new URLSearchParams({room: data.room_id, user: data.user_id});
             window.location.href = "/room?" + params.toString();
         } catch (e) {
             err.textContent = "Connection error: " + e.message;
@@ -284,6 +309,8 @@ ROOM_PAGE = """
 </head>
 <body>
   <div class="topbar">
+    <!-- BUG FIX: user_name now comes from the server-side room.users dict,
+         not the URL query string, so it can't be spoofed by editing the URL. -->
     <h2 style="margin:0;">Room: <code>{{ room_id }}</code> · You: <b>{{ user_name }}</b></h2>
     <a class="leave" href="/">👋 Leave room</a>
   </div>
@@ -332,6 +359,71 @@ ROOM_PAGE = """
     const clickBtn = document.getElementById("clickBtn");
     const startBtn = document.getElementById("startBtn");
     const waitBanner = document.getElementById("waitBanner");
+
+    // -----------------------------------------------------------------------
+    // DRUM SOUND  (Web Audio API, synthesised -- no file download needed)
+    // A short kick-drum-style thump: sine sub-tone with a fast pitch drop +
+    // a burst of filtered noise for the attack transient.
+    // The AudioContext is created lazily on first click to satisfy browsers'
+    // autoplay policy (audio context must be created/resumed from a user
+    // gesture; creating it at page load will leave it in "suspended" state).
+    // -----------------------------------------------------------------------
+    let _audioCtx = null;
+    function getAudioCtx() {
+        if (!_audioCtx) {
+            _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        // Resume in case the browser auto-suspended it (e.g. tab switch).
+        if (_audioCtx.state === "suspended") _audioCtx.resume();
+        return _audioCtx;
+    }
+
+    function playDrum() {
+        try {
+            const ac = getAudioCtx();
+            const now = ac.currentTime;
+
+            // --- Sub-tone (kick body) ---
+            // Pitch envelope: 180 Hz -> 40 Hz over 60 ms, then held.
+            const osc = ac.createOscillator();
+            const oscGain = ac.createGain();
+            osc.type = "sine";
+            osc.frequency.setValueAtTime(180, now);
+            osc.frequency.exponentialRampToValueAtTime(40, now + 0.06);
+            oscGain.gain.setValueAtTime(1.0, now);
+            oscGain.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
+            osc.connect(oscGain);
+            oscGain.connect(ac.destination);
+            osc.start(now);
+            osc.stop(now + 0.26);
+
+            // --- Attack noise burst (snare-like transient) ---
+            const bufLen = Math.floor(ac.sampleRate * 0.05);
+            const noiseBuf = ac.createBuffer(1, bufLen, ac.sampleRate);
+            const data = noiseBuf.getChannelData(0);
+            for (let i = 0; i < bufLen; i++) data[i] = Math.random() * 2 - 1;
+            const noise = ac.createBufferSource();
+            noise.buffer = noiseBuf;
+
+            // High-pass the noise so it sits above the sub-tone.
+            const hp = ac.createBiquadFilter();
+            hp.type = "highpass";
+            hp.frequency.value = 800;
+
+            const noiseGain = ac.createGain();
+            noiseGain.gain.setValueAtTime(0.35, now);
+            noiseGain.gain.exponentialRampToValueAtTime(0.001, now + 0.05);
+
+            noise.connect(hp);
+            hp.connect(noiseGain);
+            noiseGain.connect(ac.destination);
+            noise.start(now);
+            noise.stop(now + 0.06);
+        } catch (e) {
+            // Non-fatal: audio is a nice-to-have enhancement.
+            console.warn("playDrum error:", e);
+        }
+    }
 
     // Admin status and "started" state always come from the server's live
     // poll response, never just trusted from the URL -- so a user can't
@@ -422,6 +514,7 @@ ROOM_PAGE = """
     pollState();
 
     function sendClick() {
+        playDrum();   // fire sound immediately on the local input event, not after the round-trip
         fetch("/api/click", {
             method: "POST", headers: {"Content-Type": "application/json"},
             body: JSON.stringify({room: cfg.roomId, user_id: cfg.userId})
@@ -451,21 +544,64 @@ ROOM_PAGE = """
         if (t < 0) return 0;
         return A * t * Math.exp(-k * t);
     }
+
+    // -----------------------------------------------------------------------
+    // SPM (strokes per minute) -- ICI-based estimator
+    //
+    // WHY THE ORIGINAL KERNEL ESTIMATOR WAS WRONG FOR THIS USE CASE:
+    //   The original code used a density kernel:
+    //     rate += exp(-age/tau) / tau   for each click
+    //   This measures *how many clicks per second are arriving on average*,
+    //   which is correct for an irregular Poisson-like process.  But for a
+    //   rhythmic clicker, what you actually care about is *regularity*:
+    //   a perfectly metronomic 60 BPM player and a player clicking randomly
+    //   but averaging 60 BPM produce identical density-kernel output.
+    //   Worse, with tau=2s the estimate settles only after ~4-6 seconds, so
+    //   a player who just changed tempo sees a stale number for several beats.
+    //
+    // THE FIX -- inter-click interval (ICI) median:
+    //   This is exactly how a digital metronome works.  Each pair of
+    //   consecutive clicks defines an interval; tempo = 60 / interval.
+    //   Taking the *median* of the most recent few intervals:
+    //   - responds within 2 beats of a tempo change (no multi-second lag)
+    //   - is robust to a single mis-timed hit (median ignores outliers)
+    //   - naturally rewards regularity: a random clicker averaging 60 BPM
+    //     gets a wildly fluctuating display, not a clean "60" like before
+    //
+    // We use clicks from the last ICI_WINDOW_S seconds (default 8s) and
+    // cap at ICI_MAX_INTERVALS recent intervals so that a long-ago dense
+    // burst doesn't pollute the current tempo estimate.
+    // -----------------------------------------------------------------------
+    const ICI_WINDOW_S = 8.0;      // only consider clicks in the last N seconds
+    const ICI_MAX_INTERVALS = 8;   // use at most this many recent intervals
+
     function strokesPerMinute(clicks, now) {
-        // Continuous rate estimate: each click contributes a smoothly
-        // decaying weight exp(-age/tau)/tau instead of being a binary
-        // "in or out of a fixed window" event. A discrete 1-second bucket
-        // count can only ever produce exact multiples of 60 (0, 60, 120,
-        // ...) -- this kernel approach gives a smooth, continuously
-        // varying clicks-per-second estimate that we then scale to /min.
-        const tau = cfg.spmTau;
-        let rate = 0; // clicks per second
-        for (const c of clicks) {
-            const age = now - c;
-            if (age < 0 || age > tau * 6) continue;  // negligible contribution beyond ~6 tau
-            rate += Math.exp(-age / tau) / tau;
+        // Collect clicks within the ICI window, most recent first.
+        const recent = [];
+        for (let i = clicks.length - 1; i >= 0; i--) {
+            if (now - clicks[i] > ICI_WINDOW_S) break;
+            recent.push(clicks[i]);
         }
-        return rate * 60.0;
+        // Need at least 2 clicks to form 1 interval.
+        if (recent.length < 2) return 0;
+
+        // Compute intervals between consecutive clicks (recent[0] is newest).
+        const intervals = [];
+        const limit = Math.min(recent.length - 1, ICI_MAX_INTERVALS);
+        for (let i = 0; i < limit; i++) {
+            const interval = recent[i] - recent[i + 1];  // both are server timestamps
+            if (interval > 0) intervals.push(interval);
+        }
+        if (intervals.length === 0) return 0;
+
+        // Median interval is more robust than mean against a single mis-timed hit.
+        intervals.sort(function(a, b) { return a - b; });
+        const mid = Math.floor(intervals.length / 2);
+        const medianInterval = intervals.length % 2 === 1
+            ? intervals[mid]
+            : (intervals[mid - 1] + intervals[mid]) / 2;
+
+        return 60.0 / medianInterval;
     }
 
     // Draw loop: capped to cfg.targetFps and fully paused while the tab is
@@ -570,7 +706,7 @@ ROOM_PAGE = """
                     '<div style="border:2px solid ' + u.color + ';border-radius:10px;' +
                     'padding:8px 18px;min-width:140px;text-align:center;background:rgba(255,255,255,0.03);">' +
                     '<div style="color:' + u.color + ';font-size:13px;font-weight:600;margin-bottom:2px;">' + label + '</div>' +
-                    '<div style="color:#ffffff;font-size:34px;font-weight:800;line-height:1;">' + spm.toFixed(0) + '</div>' +
+                    '<div style="color:#ffffff;font-size:34px;font-weight:800;line-height:1;">' + (spm > 0 ? spm.toFixed(0) : "—") + '</div>' +
                     '<div style="color:#999;font-size:11px;">strokes / min</div>' +
                     '</div>'
                 );
@@ -610,19 +746,24 @@ def join_page():
 def room_page():
     room_id = request.args.get("room", "")
     user_id = request.args.get("user", "")
-    user_name = request.args.get("name", "")
     if not room_id or not user_id:
         return ("", 302, {"Location": "/"})
     # Make sure the user actually exists in the room (e.g. after a server
     # restart); if not, bounce back to the join page.
-    room = get_or_create_room(room_id)
-    if user_id not in room.users:
-        return ("", 302, {"Location": "/"})
+    with _lock:
+        room = get_or_create_room(room_id)
+        if user_id not in room.users:
+            return ("", 302, {"Location": "/"})
+        # BUG FIX: read the canonical name from room state, not the URL.
+        # The original code passed user_name straight from the query string,
+        # meaning anyone could display an arbitrary name by editing the URL
+        # after joining.
+        user_name = room.users[user_id]["name"]
     return render_template_string(
         ROOM_PAGE,
         room_id=room_id,
         user_id=user_id,
-        user_name=user_name,
+        user_name=user_name,      # authoritative name from server state
         window_seconds=WINDOW_SECONDS,
         pulse_a=PULSE_A,
         pulse_k=PULSE_K,
