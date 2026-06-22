@@ -204,6 +204,7 @@ JOIN_PAGE = """
 <html>
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
   <title>Sync Clicker Trainer</title>
   <style>
     body { background:#0e1117; color:#eee; font-family:sans-serif; display:flex;
@@ -262,6 +263,7 @@ ROOM_PAGE = """
 <html>
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
   <title>Sync Clicker Trainer — {{ room_id }}</title>
   <style>
     body { background:#0e1117; color:#eee; font-family:sans-serif; margin:0; padding:20px; }
@@ -271,9 +273,11 @@ ROOM_PAGE = """
     .head { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
     #statusText { color:#888; font-size:12px; }
     #clickBtn { background:#ff4b4b; color:white; border:none; border-radius:6px;
-                padding:14px 28px; font-size:16px; font-weight:bold; cursor:pointer; }
+                padding:14px 28px; font-size:16px; font-weight:bold; cursor:pointer;
+                touch-action:manipulation; user-select:none; -webkit-tap-highlight-color:transparent; }
     #clickBtn:disabled { background:#3a2f33; color:#888; cursor:not-allowed; }
-    canvas { width:100%; height:430px; display:block; border-radius:6px; }
+    canvas { width:100%; height:430px; display:block; border-radius:6px;
+             touch-action:manipulation; user-select:none; }
     #spsRow { display:flex; gap:14px; margin-top:14px; flex-wrap:wrap; }
     .cap { color:#777; font-size:12px; margin-top:14px; }
   </style>
@@ -377,8 +381,12 @@ ROOM_PAGE = """
     window.addEventListener("resize", resize);
 
     let latestUsers = [];
-    let serverNowAtLastFetch = Date.now() / 1000;
-    let clientMsAtLastFetch = performance.now();
+    // The "what time is it on the server right now" estimate is smoothed
+    // (exponential moving average) instead of snapped to each poll's raw
+    // value. Network latency varies poll to poll (e.g. 60ms vs 180ms), and
+    // snapping directly to it was making the whole curve visibly jitter
+    // left/right every ~300ms. Smoothing absorbs that noise.
+    let serverOffsetSec = null;  // serverTime - performance.now()/1000, once established
 
     statusEl.textContent = "connecting...";
 
@@ -390,8 +398,14 @@ ROOM_PAGE = """
                 if (!res.ok) throw new Error("HTTP " + res.status);
                 const data = await res.json();
                 latestUsers = data.users;
-                serverNowAtLastFetch = data.serverNow;
-                clientMsAtLastFetch = performance.now();
+
+                const rawOffset = data.serverNow - performance.now() / 1000.0;
+                if (serverOffsetSec === null) {
+                    serverOffsetSec = rawOffset;       // snap on the very first sample
+                } else {
+                    const alpha = 0.15;                // smoothing factor: lower = smoother, slower to adapt
+                    serverOffsetSec = serverOffsetSec * (1 - alpha) + rawOffset * alpha;
+                }
 
                 isAdmin = (data.adminId === cfg.userId);
                 sessionStarted = !!data.started;
@@ -407,19 +421,31 @@ ROOM_PAGE = """
     }
     pollState();
 
-    clickBtn.addEventListener("click", function() {
+    function sendClick() {
         fetch("/api/click", {
             method: "POST", headers: {"Content-Type": "application/json"},
             body: JSON.stringify({room: cfg.roomId, user_id: cfg.userId})
         }).catch(function(e) { statusEl.textContent = "click failed: " + e.message; });
+    }
+    // pointerdown fires immediately and uniformly for mouse/touch/pen --
+    // unlike "click", it has no ~300ms tap-disambiguation delay on mobile.
+    clickBtn.addEventListener("pointerdown", function(e) {
+        e.preventDefault();
+        if (clickBtn.disabled) return;
+        sendClick();
     });
-    canvas.addEventListener("click", function() { clickBtn.click(); });
+    canvas.addEventListener("pointerdown", function(e) {
+        e.preventDefault();
+        if (clickBtn.disabled) return;  // mirror the button's gated state
+        sendClick();
+    });
     window.addEventListener("keydown", function(e) {
-        if (e.code === "Space") { e.preventDefault(); clickBtn.click(); }
+        if (e.code === "Space" && !clickBtn.disabled) { e.preventDefault(); sendClick(); }
     });
 
     function currentServerTime() {
-        return serverNowAtLastFetch + (performance.now() - clientMsAtLastFetch) / 1000.0;
+        if (serverOffsetSec === null) return Date.now() / 1000.0;
+        return performance.now() / 1000.0 + serverOffsetSec;
     }
     function pulse(t, A, k) {
         if (t < 0) return 0;
