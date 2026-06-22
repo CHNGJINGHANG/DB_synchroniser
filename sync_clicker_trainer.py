@@ -49,7 +49,7 @@ PORT = int(os.environ.get("PORT", 8765))  # hosting platforms set PORT themselve
 WINDOW_SECONDS = 15.0          # how much time history is visible on screen
 PULSE_A = 5.0                  # pulse amplitude scale
 PULSE_K = 8.0                  # pulse decay rate
-SPS_WINDOW = 1.0               # sliding window (seconds) used to compute strokes-per-minute
+SPM_TAU = 2.0                  # smoothing time constant (seconds) for the continuous strokes/min estimate
 TARGET_FPS = 30                # cap the canvas redraw rate (display refresh rate is overkill)
 CURVE_SAMPLES = 90             # points per curve -- visually smooth, cheap to compute
 MAX_DPR = 1.5                  # cap canvas pixel density (uncapped DPR can be 2-3x on Retina/4K)
@@ -317,7 +317,7 @@ ROOM_PAGE = """
         windowSeconds: {{ window_seconds }},
         A: {{ pulse_a }},
         k: {{ pulse_k }},
-        spsWindow: {{ sps_window }},
+        spmTau: {{ spm_tau }},
         targetFps: {{ target_fps }},
         curveSamples: {{ curve_samples }},
         maxDpr: {{ max_dpr }},
@@ -452,9 +452,20 @@ ROOM_PAGE = """
         return A * t * Math.exp(-k * t);
     }
     function strokesPerMinute(clicks, now) {
-        let count = 0;
-        for (const c of clicks) { if (now - c <= cfg.spsWindow) count++; }
-        return (count / cfg.spsWindow) * 60.0;
+        // Continuous rate estimate: each click contributes a smoothly
+        // decaying weight exp(-age/tau)/tau instead of being a binary
+        // "in or out of a fixed window" event. A discrete 1-second bucket
+        // count can only ever produce exact multiples of 60 (0, 60, 120,
+        // ...) -- this kernel approach gives a smooth, continuously
+        // varying clicks-per-second estimate that we then scale to /min.
+        const tau = cfg.spmTau;
+        let rate = 0; // clicks per second
+        for (const c of clicks) {
+            const age = now - c;
+            if (age < 0 || age > tau * 6) continue;  // negligible contribution beyond ~6 tau
+            rate += Math.exp(-age / tau) / tau;
+        }
+        return rate * 60.0;
     }
 
     // Draw loop: capped to cfg.targetFps and fully paused while the tab is
@@ -615,7 +626,7 @@ def room_page():
         window_seconds=WINDOW_SECONDS,
         pulse_a=PULSE_A,
         pulse_k=PULSE_K,
-        sps_window=SPS_WINDOW,
+        spm_tau=SPM_TAU,
         target_fps=TARGET_FPS,
         curve_samples=CURVE_SAMPLES,
         max_dpr=MAX_DPR,
